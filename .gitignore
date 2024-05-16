@@ -7,6 +7,7 @@
 *.dll
 *.so
 *.dylib
+neighborhood
 
 # Test binary, built with `go test -c`
 *.test
