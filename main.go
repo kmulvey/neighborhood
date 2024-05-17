@@ -95,9 +95,12 @@ func (n *Node) gossipHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (n *Node) mergeNodes(incomingNode Node) {
+// return values:
+// 1. incomingNode gave us a newer value
+// 2. we have a newer value than incomingNode
+func (n *Node) mergeNodes(incomingNode Node) (bool, bool) {
 
-	// fmt.Printf("to: %s, from: %s \n", n.HTTPAddr, incomingNode.HTTPAddr)
+	var receivedNewerValue, haveNewerValue bool
 
 	// handle incoming peer's peers first
 	for incomingID, incomingPeer := range incomingNode.PeerData {
@@ -108,12 +111,16 @@ func (n *Node) mergeNodes(incomingNode Node) {
 		if existingPeer, exists := n.PeerData[incomingID]; !exists {
 			incomingPeer.PeerData = nil // we nil this because we dont want endless maps of peers
 			n.PeerData[incomingID] = incomingPeer
+			receivedNewerValue = true
 		} else {
 			if incomingPeer.MessageSequenceNum > existingPeer.MessageSequenceNum {
 				var tempNode = n.PeerData[incomingID]
 				tempNode.MessageSequenceNum = incomingPeer.MessageSequenceNum
 				tempNode.Message = incomingPeer.Message
 				n.PeerData[incomingID] = tempNode
+				receivedNewerValue = true
+			} else if incomingPeer.MessageSequenceNum < existingPeer.MessageSequenceNum {
+				haveNewerValue = true
 			}
 		}
 	}
@@ -122,12 +129,18 @@ func (n *Node) mergeNodes(incomingNode Node) {
 	if _, exists := n.PeerData[incomingNode.ID]; !exists {
 		incomingNode.PeerData = nil // we nil this because we dont want endless maps of peers
 		n.PeerData[incomingNode.ID] = incomingNode
+		receivedNewerValue = true
 	} else {
 		if incomingNode.MessageSequenceNum > n.PeerData[incomingNode.ID].MessageSequenceNum {
 			var tempNode = n.PeerData[incomingNode.ID]
 			tempNode.MessageSequenceNum = incomingNode.MessageSequenceNum
 			tempNode.Message = incomingNode.Message
 			n.PeerData[incomingNode.ID] = tempNode
+			receivedNewerValue = true
+		} else if incomingNode.MessageSequenceNum < n.PeerData[incomingNode.ID].MessageSequenceNum {
+			haveNewerValue = true
 		}
 	}
+
+	return receivedNewerValue, haveNewerValue
 }
