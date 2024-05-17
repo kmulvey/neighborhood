@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -57,42 +58,77 @@ func (n *Node) BroadcastNodeInfo() error {
 
 	nodeJSON, err := json.Marshal(n)
 	if err != nil {
-		return (err)
+		return err
 	}
 
 	for _, peerData := range n.PeerData {
-
 		resp, err := http.Post(peerData.HTTPAddr, "application/json", bytes.NewBuffer(nodeJSON))
 		if err != nil {
-			return (err)
+			return err
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			return errors.New("did not get 200, got: " + resp.Status)
 		}
+
+		// the node we just sent to could of had newer data than us, lets update
+		incomingNode, err := parseRequestBody(resp.Body)
+		if err != nil {
+			return err
+		}
+
+		n.mergeNodes(incomingNode)
 	}
 
 	return nil
 }
 
-func (n *Node) gossipHandler(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Error reading request body", http.StatusInternalServerError)
-		return
-	}
-
+func parseRequestBody(body io.ReadCloser) (Node, error) {
 	var incomingNode Node
-	if err := json.Unmarshal(body, &incomingNode); err != nil {
-		http.Error(w, "Error parsing request body", http.StatusBadRequest)
+
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return incomingNode, fmt.Errorf("error reading request body, err: %w", err)
+	}
+
+	if err := json.Unmarshal(bodyBytes, &incomingNode); err != nil {
+		return incomingNode, fmt.Errorf("error parsing request body, err: %w", err)
+	}
+
+	return incomingNode, nil
+}
+
+// return 201 means we got updated
+// return 200 means we were already up to date
+func (n *Node) gossipHandler(w http.ResponseWriter, r *http.Request) {
+	var incomingNode, err = parseRequestBody(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	n.mergeNodes(incomingNode)
+	var receivedNewerValue, haveNewerValue = n.mergeNodes(incomingNode)
+	// if we have newer data that the sender doesnt, than lets tell them
+	if haveNewerValue {
+		n.Message = time.Now()
+		n.MessageSequenceNum = n.MessageSequenceNum + 1
 
-	// fmt.Printf("node: %s got message num: %d, message: %v, from node: %s \n", n.HTTPAddr, incomingNode.MessageSequenceNum, incomingNode.Message, incomingNode.HTTPAddr)
+		nodeJSON, err := json.Marshal(n)
+		if err != nil {
+			http.Error(w, "Error marshaling node data to json: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := w.Write(nodeJSON); err != nil {
+			http.Error(w, "Error sending back node data: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 
-	w.WriteHeader(http.StatusOK)
+	if receivedNewerValue {
+		w.WriteHeader(http.StatusCreated)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
 // return values:
