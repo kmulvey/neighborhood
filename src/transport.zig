@@ -12,6 +12,10 @@ const Address = types.Address;
 pub const max_packet_size = 65535;
 
 /// A received packet with metadata.
+///
+/// **Buffer lifetime:** `buf` is a slice into `UdpTransport.recv_buf`.
+/// The next call to `recvFrom` **will overwrite** the buffer contents.
+/// Callers must copy data before the next receive.
 pub const Packet = struct {
     buf: []u8,
     from: Address,
@@ -61,6 +65,10 @@ pub const UdpTransport = struct {
     }
 
     /// Receive a single packet (blocking).  Returns null on WouldBlock.
+    ///
+    /// **The returned Packet.buf is a slice into the transport's internal
+    /// buffer and will be overwritten by the next call to recvFrom.**
+    /// Copy the data before the next receive.
     pub fn recvFrom(self: *UdpTransport, now_ms: i64) !?Packet {
         var client_addr: std.posix.sockaddr.in = undefined;
         var client_addr_len: std.posix.socklen_t = @sizeOf(@TypeOf(client_addr));

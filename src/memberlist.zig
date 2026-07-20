@@ -8,6 +8,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const config_mod = @import("config.zig");
 const protocol = @import("protocol.zig");
+const suspicion_mod = @import("suspicion.zig");
 
 const Config = config_mod.Config;
 const Node = types.Node;
@@ -17,6 +18,7 @@ const Address = types.Address;
 const MessageType = types.MessageType;
 const Action = types.Action;
 const ActionTag = types.ActionTag;
+const Suspicion = suspicion_mod.Suspicion;
 
 const NodeEntry = struct {
     node: Node,
@@ -27,7 +29,6 @@ const ProbeState = enum {
     idle,
     waiting_direct,
     waiting_indirect,
-    suspect,
 };
 
 pub const Memberlist = struct {
@@ -43,10 +44,11 @@ pub const Memberlist = struct {
     probe_seqno: u32,
     indirect_peers: [3]usize,
     indirect_ack_count: u8,
-    indirect_timeout_count: u8,
     probe_start_ms: i64,
-    indirect_start_ms: i64,
-    ack_handlers: std.AutoHashMapUnmanaged(u32, AckHandler),
+    /// Absolute deadline (ms) by which all indirect probes must be answered.
+    indirect_deadline_ms: i64,
+    /// Map of node_name → Suspicion for nodes currently in .suspect state.
+    suspicions: std.StringHashMapUnmanaged(Suspicion),
     leaving: bool,
     shutdown: bool,
     join_order: std.ArrayListUnmanaged(usize),
@@ -54,12 +56,8 @@ pub const Memberlist = struct {
     self_index: usize,
     protocol_period_ms: i64,
     indirect_timeout_ms: i64,
-
-    const AckHandler = struct {
-        ack_fn: *const fn (payload: []const u8, timestamp: i64) void,
-        nack_fn: *const fn () void,
-        deadline_ms: i64,
-    };
+    /// Counts ticks since last join_order reshuffle.
+    tick_count: u64,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Memberlist {
         var nodes: std.ArrayListUnmanaged(NodeEntry) = .empty;
@@ -83,14 +81,15 @@ pub const Memberlist = struct {
             .incarnation = 0, .seqno = 1,
             .probe_index = 0, .probe_state = .idle, .probe_seqno = 0,
             .indirect_peers = [_]usize{0} ** 3,
-            .indirect_ack_count = 0, .indirect_timeout_count = 0,
-            .probe_start_ms = 0, .indirect_start_ms = 0,
-            .ack_handlers = .{},
+            .indirect_ack_count = 0,
+            .probe_start_ms = 0, .indirect_deadline_ms = 0,
+            .suspicions = .{},
             .leaving = false, .shutdown = false,
             .join_order = join_order,
             .self_name = self_name, .self_index = 0,
             .protocol_period_ms = @intCast(config.protocol_period_ms),
             .indirect_timeout_ms = @intCast(config.protocol_period_ms),
+            .tick_count = 0,
         };
     }
 
@@ -98,7 +97,13 @@ pub const Memberlist = struct {
         for (self.nodes.items) |*entry| self.allocator.free(entry.node.name);
         self.nodes.deinit(self.allocator);
         self.name_to_index.deinit(self.allocator);
-        self.ack_handlers.deinit(self.allocator);
+        // Free suspicion timers.
+        var sit = self.suspicions.iterator();
+        while (sit.next()) |entry| {
+            var s = entry.value_ptr;
+            s.deinit(self.allocator);
+        }
+        self.suspicions.deinit(self.allocator);
         self.join_order.deinit(self.allocator);
         self.* = undefined;
     }
@@ -120,12 +125,68 @@ pub const Memberlist = struct {
         if (self.shutdown) return &[_]Action{};
         var actions: std.ArrayListUnmanaged(Action) = .empty;
 
+        // ---- B3: expire suspicion timers ----
+        var expired: std.ArrayListUnmanaged(usize) = .empty;
+        defer expired.deinit(self.allocator);
+
+        var sit = self.suspicions.iterator();
+        while (sit.next()) |entry| {
+            if (entry.value_ptr.remainingMs(now_ms) <= 0) {
+                try expired.append(self.allocator, entry.key_ptr.*.len);
+                // Look up the node index to emit node_failed.
+                if (self.name_to_index.get(entry.key_ptr.*)) |idx| {
+                    var target = &self.nodes.items[idx];
+                    if (target.node.state == .suspect) {
+                        target.node.state = .dead;
+                        target.last_heard_ms = now_ms;
+                        try actions.append(alloc, .{ .node_failed = .{
+                            .node = target.node.name, .addr = target.node.addr,
+                        } });
+                        // Encode a Dead message for gossip dissemination.
+                        var dead_buf: [512]u8 = undefined;
+                        const dead_msg = types.Dead{
+                            .node = target.node.name,
+                            .addr = target.node.addr,
+                            .incarnation = target.node.incarnation,
+                            .from = self.self_name,
+                        };
+                        const dead_n = try protocol.encodeDead(&dead_buf, dead_msg);
+                        try actions.append(alloc, .{ .send_gossip = .{
+                            .target_addrs = &.{},
+                            .payload = dead_buf[0..dead_n],
+                        } });
+                    }
+                }
+            }
+        }
+        // Remove expired suspicions (note: iterator above captured keys by length).
+        for (expired.items) |key_len| {
+            // Find the key by matching length — the iterator order is stable.
+            var sit2 = self.suspicions.iterator();
+            while (sit2.next()) |e2| {
+                if (e2.key_ptr.*.len == key_len) {
+                    e2.value_ptr.deinit(self.allocator);
+                    _ = self.suspicions.remove(e2.key_ptr.*);
+                    break;
+                }
+            }
+        }
+
+        // ---- Probe state machine ----
         switch (self.probe_state) {
             .idle => {
+                self.tick_count += 1;
                 if (self.nodes.items.len <= 1) return actions.toOwnedSlice(alloc);
                 if (self.join_order.items.len <= 1) return actions.toOwnedSlice(alloc);
-                // Round-robin: advance index, skip self
+
+                // Round-robin: advance index.
                 self.probe_index = (self.probe_index + 1) % self.join_order.items.len;
+
+                // B4: reshuffle + compact on wrap-around.
+                if (self.probe_index == 0 and self.tick_count > 1) {
+                    try self.reshuffleJoinOrder(now_ms, alloc);
+                }
+
                 const node_idx = self.join_order.items[self.probe_index];
                 if (node_idx == self.self_index) return actions.toOwnedSlice(alloc);
                 const target = self.nodes.items[node_idx];
@@ -145,18 +206,41 @@ pub const Memberlist = struct {
                 }
             },
             .waiting_indirect => {
-                if (now_ms - self.indirect_start_ms > self.indirect_timeout_ms) {
-                    self.indirect_timeout_count += 1;
-                    if (self.indirect_timeout_count >= self.config.indirect_checks) {
-                        try self.markSuspect(self.join_order.items[self.probe_index], now_ms, alloc, &actions);
-                    } else {
-                        self.indirect_start_ms = now_ms;
-                    }
+                // S2: single deadline instead of counting.
+                if (now_ms >= self.indirect_deadline_ms) {
+                    try self.markSuspect(self.join_order.items[self.probe_index], now_ms, alloc, &actions);
                 }
             },
-            .suspect => { self.probe_state = .idle; },
         }
         return actions.toOwnedSlice(alloc);
+    }
+
+    /// B4: Reshuffle join_order (Fisher-Yates) and compact dead/left entries.
+    fn reshuffleJoinOrder(self: *Memberlist, seed: i64, alloc: std.mem.Allocator) !void {
+        // Compact: filter out dead/left entries (except self at position 0).
+        var compacted: std.ArrayListUnmanaged(usize) = .empty;
+        try compacted.append(alloc, 0); // Keep self.
+        for (self.join_order.items) |idx| {
+            if (idx == 0) continue; // Already added self.
+            const entry = self.nodes.items[idx];
+            if (entry.node.state == .dead or entry.node.state == .left) continue;
+            try compacted.append(alloc, idx);
+        }
+        self.join_order.deinit(self.allocator);
+        self.join_order = compacted;
+
+        // Shuffle indices 1..len (keep self at position 0).
+        if (self.join_order.items.len > 2) {
+            var rng = std.Random.DefaultPrng.init(@intCast(seed));
+            const random = rng.random();
+            var i: usize = self.join_order.items.len - 1;
+            while (i > 1) : (i -= 1) {
+                const j = 1 + random.uintLessThan(usize, i);
+                const tmp = self.join_order.items[i];
+                self.join_order.items[i] = self.join_order.items[j];
+                self.join_order.items[j] = tmp;
+            }
+        }
     }
 
     fn dispatchIndirect(self: *Memberlist, now_ms: i64, alloc: std.mem.Allocator, actions: *std.ArrayListUnmanaged(Action)) !void {
@@ -191,9 +275,9 @@ pub const Memberlist = struct {
             } });
         }
         self.probe_state = .waiting_indirect;
-        self.indirect_start_ms = now_ms;
+        // S2: single deadline = now + K * timeout_per_cycle.
+        self.indirect_deadline_ms = now_ms + self.indirect_timeout_ms * @as(i64, self.config.indirect_checks);
         self.indirect_ack_count = 0;
-        self.indirect_timeout_count = 0;
     }
 
     fn markSuspect(self: *Memberlist, target_idx: usize, now_ms: i64, alloc: std.mem.Allocator, actions: *std.ArrayListUnmanaged(Action)) !void {
@@ -202,7 +286,19 @@ pub const Memberlist = struct {
         target.node.state = .suspect;
         target.last_heard_ms = now_ms;
         self.probe_state = .idle;
+        // S4: advance probe_index past the just-suspected node to avoid wasted re-probe.
+        self.probe_index = (self.probe_index + 1) % self.join_order.items.len;
         try actions.append(alloc, .{ .node_suspected = .{ .node = target.node.name, .addr = target.node.addr } });
+
+        // B3: create a suspicion timer for this node.
+        // k = suspicion_mult, min = k * protocol_period_ms, max = min * max_timeout_mult.
+        const k: u8 = self.config.suspicion_mult;
+        const min_ms: i64 = @as(i64, k) * self.protocol_period_ms;
+        const max_ms: i64 = min_ms * @as(i64, self.config.suspicion_max_timeout_mult);
+        const s = try Suspicion.init(alloc, self.self_name, k, min_ms, max_ms, now_ms);
+        const node_name_owned = try alloc.dupe(u8, target.node.name);
+        errdefer alloc.free(node_name_owned);
+        try self.suspicions.put(alloc, node_name_owned, s);
     }
 
     /// Process an incoming raw packet. Returns owned slice of actions.
@@ -215,7 +311,6 @@ pub const Memberlist = struct {
         if (data.len < 1) return actions.toOwnedSlice(alloc);
 
         const msg_type: MessageType = @enumFromInt(data[0]);
-        _ = from_name;
 
         switch (msg_type) {
             .ping => {
@@ -248,6 +343,10 @@ pub const Memberlist = struct {
             .suspect => {
                 const suspect = try protocol.decodeSuspect(alloc, data);
                 defer protocol.freeDecodedSuspect(&suspect, alloc);
+                // B3: confirm on existing suspicion timer to accelerate it.
+                if (self.suspicions.getPtr(suspect.node)) |s| {
+                    _ = try s.confirm(suspect.from, alloc);
+                }
                 try self.applySuspect(suspect.node, suspect.addr, suspect.incarnation, timestamp_ms, alloc, &actions);
             },
             .dead => {
@@ -259,12 +358,12 @@ pub const Memberlist = struct {
                 var compound = try protocol.decodeCompound(alloc, data);
                 defer protocol.freeDecodedCompound(&compound, alloc);
                 for (compound.messages.items) |inner| {
-                    const inner_actions = try self.handlePacket(inner.payload, from_addr, "", timestamp_ms, alloc);
+                    const inner_actions = try self.handlePacket(inner.payload, from_addr, from_name, timestamp_ms, alloc);
                     defer alloc.free(inner_actions);
                     try actions.appendSlice(alloc, inner_actions);
                 }
             },
-            .user => { _ = @TypeOf(data); },
+            .user => {},
             else => {},
         }
         return actions.toOwnedSlice(alloc);
@@ -275,11 +374,17 @@ pub const Memberlist = struct {
             if (incarnation > self.incarnation) self.incarnation = incarnation;
             return;
         }
+        // B3: if this node was suspected, remove its suspicion timer (alive refutes it).
+        if (self.suspicions.getPtr(name)) |s| {
+            s.deinit(alloc);
+            _ = self.suspicions.remove(name);
+        }
         if (self.name_to_index.get(name)) |idx| {
             var entry = &self.nodes.items[idx];
             if (incarnation > entry.node.incarnation or (incarnation == entry.node.incarnation and entry.node.state != .alive)) {
                 entry.node.incarnation = incarnation;
                 entry.node.state = .alive;
+                entry.node.addr = addr;
                 entry.last_heard_ms = ts;
                 try actions.append(alloc, .{ .node_alive = .{ .node = name, .addr = addr } });
             }
@@ -298,7 +403,32 @@ pub const Memberlist = struct {
 
     fn applySuspect(self: *Memberlist, name: []const u8, addr: Address, incarnation: Incarnation, ts: i64, alloc: std.mem.Allocator, actions: *std.ArrayListUnmanaged(Action)) !void {
         if (std.mem.eql(u8, name, self.self_name)) {
-            if (incarnation >= self.incarnation) self.incarnation = incarnation + 1;
+            // B2: Emit self-refutation via send_gossip to all alive peers.
+            if (incarnation >= self.incarnation) {
+                self.incarnation = incarnation + 1;
+                // Encode an Alive message for dissemination.
+                var alive_buf: [512]u8 = undefined;
+                const alive_msg = types.Alive{
+                    .node = self.self_name,
+                    .addr = self.nodes.items[self.self_index].node.addr,
+                    .incarnation = self.incarnation,
+                    .meta = "",
+                };
+                const alive_n = try protocol.encodeAlive(&alive_buf, alive_msg);
+                // Collect addresses of all alive peers.
+                var peer_addrs: std.ArrayListUnmanaged(Address) = .empty;
+                for (self.nodes.items) |entry| {
+                    if (entry.node.state == .alive and entry.node.name.len > 0 and
+                        !std.mem.eql(u8, entry.node.name, self.self_name))
+                    {
+                        try peer_addrs.append(alloc, entry.node.addr);
+                    }
+                }
+                try actions.append(alloc, .{ .send_gossip = .{
+                    .target_addrs = try peer_addrs.toOwnedSlice(alloc),
+                    .payload = alive_buf[0..alive_n],
+                } });
+            }
             return;
         }
         if (self.name_to_index.get(name)) |idx| {
@@ -314,6 +444,11 @@ pub const Memberlist = struct {
 
     fn applyDead(self: *Memberlist, name: []const u8, addr: Address, incarnation: Incarnation, ts: i64, alloc: std.mem.Allocator, actions: *std.ArrayListUnmanaged(Action)) !void {
         if (std.mem.eql(u8, name, self.self_name)) return;
+        // B3: remove suspicion timer on dead confirmation.
+        if (self.suspicions.getPtr(name)) |s| {
+            s.deinit(alloc);
+            _ = self.suspicions.remove(name);
+        }
         if (self.name_to_index.get(name)) |idx| {
             var entry = &self.nodes.items[idx];
             if (incarnation >= entry.node.incarnation) {
@@ -423,4 +558,36 @@ test "memberlist incarnation overrides" {
     }
     try std.testing.expectEqual(NodeState.alive, ml.nodes.items[1].node.state);
     try std.testing.expectEqual(@as(Incarnation, 1), ml.nodes.items[1].node.incarnation);
+}
+
+test "self suspect refutation emits send_gossip" {
+    const alloc = std.testing.allocator;
+    var ml = try Memberlist.init(alloc, Config{ .name = "node-a" });
+    defer ml.deinit();
+
+    // First add another node so there's a peer to gossip to.
+    {
+        var buf: [256]u8 = undefined;
+        const alive = types.Alive{ .node = "node-b", .addr = Address.initIp4([4]u8{ 127, 0, 0, 2 }, 7946), .incarnation = 0, .meta = "" };
+        const n = try protocol.encodeAlive(&buf, alive);
+        const from = Address.initIp4([4]u8{ 127, 0, 0, 2 }, 7946);
+        const actions = try ml.handlePacket(buf[0..n], from, "node-b", 0, alloc);
+        defer alloc.free(actions);
+    }
+
+    // Now suspect self.
+    {
+        var buf: [256]u8 = undefined;
+        const suspect = types.Suspect{ .node = "node-a", .addr = Address.initIp4([4]u8{ 127, 0, 0, 1 }, 7946), .incarnation = 0, .from = "node-c" };
+        const n = try protocol.encodeSuspect(&buf, suspect);
+        const from = Address.initIp4([4]u8{ 127, 0, 0, 3 }, 7946);
+        const actions = try ml.handlePacket(buf[0..n], from, "", 0, alloc);
+        defer alloc.free(actions);
+
+        // Should have emitted send_gossip with our new alive message.
+        try std.testing.expect(actions.len >= 1);
+        try std.testing.expectEqual(ActionTag.send_gossip, actions[0]);
+        // Incarnation should have been incremented.
+        try std.testing.expectEqual(@as(Incarnation, 1), ml.incarnation);
+    }
 }

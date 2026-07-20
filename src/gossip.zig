@@ -106,19 +106,18 @@ pub const TransmitLimitedQueue = struct {
     /// Returns messages that haven't yet reached the retransmit limit,
     /// ordered by priority.  Increments transmit counts.
     pub fn getMessages(self: *TransmitLimitedQueue, max_bytes: usize) ![]QueuedMessage {
-        var result = std.ArrayList(QueuedMessage).init(self.allocator);
-        errdefer result.deinit();
+        var result: std.ArrayListUnmanaged(QueuedMessage) = .empty;
 
         const max_tx = self.maxTransmits();
         var total_bytes: usize = 0;
 
-        // Build a sorted list of eligible messages
-        var eligible = std.ArrayList(usize).init(self.allocator);
-        defer eligible.deinit();
+        // Build a sorted list of eligible messages.
+        var eligible: std.ArrayListUnmanaged(usize) = .empty;
+        defer eligible.deinit(self.allocator);
 
         for (self.messages.items, 0..) |_, i| {
             if (self.messages.items[i].transmits < max_tx) {
-                try eligible.append(i);
+                try eligible.append(self.allocator, i);
             }
         }
 
@@ -126,26 +125,40 @@ pub const TransmitLimitedQueue = struct {
         const ctx = self;
         std.mem.sort(usize, eligible.items, ctx, lessFn);
 
+        // Collect indices that hit the retransmit limit, then swapRemove
+        // them in reverse order so lower indices stay valid.
+        var to_remove: std.ArrayListUnmanaged(usize) = .empty;
+        defer to_remove.deinit(self.allocator);
+
         for (eligible.items) |i| {
             const msg = &self.messages.items[i];
             if (total_bytes + msg.payload.len > max_bytes) continue;
             total_bytes += msg.payload.len;
-            try result.append(msg.*);
+            try result.append(self.allocator, msg.*);
             msg.transmits += 1;
 
-            // Remove from queue if it hit the limit
             if (msg.transmits >= max_tx) {
-                _ = self.node_index.remove(msg.node);
-                self.allocator.free(msg.node);
-                self.allocator.free(msg.payload);
-                _ = self.messages.swapRemove(i);
-                // Indices shifted, but we're continuing the loop — sorting
-                // was done on the original indices, so this is fine for a
-                // fire-and-forget gossip round.
+                try to_remove.append(self.allocator, i);
             }
         }
 
-        return result.toOwnedSlice();
+        // Remove in reverse order — the indices in `to_remove` are
+        // monotonically non-decreasing (eligible was sorted by index
+        // order within the messages list), so reverse preserves validity
+        // for each swapRemove (the last element shifts left).
+        if (to_remove.items.len > 0) {
+            std.mem.sort(usize, to_remove.items, {}, struct {
+                fn desc(_: void, a: usize, b: usize) bool { return a > b; }
+            }.desc);
+            for (to_remove.items) |ri| {
+                _ = self.node_index.remove(self.messages.items[ri].node);
+                self.allocator.free(self.messages.items[ri].node);
+                self.allocator.free(self.messages.items[ri].payload);
+                _ = self.messages.swapRemove(ri);
+            }
+        }
+
+        return result.toOwnedSlice(self.allocator);
     }
 
     /// Sort comparator for priority ordering.
