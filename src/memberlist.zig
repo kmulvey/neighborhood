@@ -127,20 +127,16 @@ pub const Memberlist = struct {
         var actions: std.ArrayListUnmanaged(Action) = .empty;
 
         // ---- B3: expire suspicion timers ----
-        // Collect keys of expired suspicions (must dup because the iterator
-        // borrows from the map and we can't remove while iterating).
+        // Collect keys (as mutable slices via @constCast) of expired
+        // suspicions so we can free them after removal from the HashMap.
         var expired: std.ArrayListUnmanaged([]u8) = .empty;
-        defer {
-            for (expired.items) |k| self.allocator.free(k);
-            expired.deinit(self.allocator);
-        }
+        defer expired.deinit(self.allocator);
 
         var sit = self.suspicions.iterator();
         while (sit.next()) |entry| {
             if (entry.value_ptr.remainingMs(now_ms) <= 0) {
-                const key_copy = try self.allocator.dupe(u8, entry.key_ptr.*);
-                errdefer self.allocator.free(key_copy);
-                try expired.append(self.allocator, key_copy);
+                // Save the actual HashMap key pointer — we'll free it after removal.
+                try expired.append(self.allocator, @constCast(entry.key_ptr.*));
                 // Look up the node index to emit node_failed.
                 if (self.name_to_index.get(entry.key_ptr.*)) |idx| {
                     var target = &self.nodes.items[idx];
@@ -174,16 +170,15 @@ pub const Memberlist = struct {
                 }
             }
         }
-        // Remove expired suspicions by exact key match.
-        for (expired.items) |key_copy| {
-            if (self.suspicions.getEntry(key_copy)) |entry| {
-                const original_key = entry.key_ptr.*;
-                entry.value_ptr.deinit(self.allocator);
-                _ = self.suspicions.remove(key_copy);
-                self.allocator.free(original_key);
+        // Remove expired suspicions and free the keys.
+        for (expired.items) |key| {
+            if (self.suspicions.getPtr(key)) |s| {
+                s.deinit(self.allocator);
+            }
+            if (self.suspicions.remove(key)) {
+                self.allocator.free(key);
             }
         }
-
         // ---- Probe state machine ----
         switch (self.probe_state) {
             .idle => {
