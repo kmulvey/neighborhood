@@ -32,8 +32,11 @@ pub const Suspicion = struct {
     ) !Suspicion {
         var confirmations = std.StringHashMapUnmanaged(void){};
         // Exclude the "from" node from confirmations (SWIM: we may get our
-        // own suspicion gossiped back to us).
-        try confirmations.put(allocator, from, {});
+        // own suspicion gossiped back to us).  Own the key so deinit can
+        // free it uniformly.
+        const from_owned = try allocator.dupe(u8, from);
+        errdefer allocator.free(from_owned);
+        try confirmations.put(allocator, from_owned, {});
         return Suspicion{
             .n = 0,
             .k = @intCast(k),
@@ -46,6 +49,10 @@ pub const Suspicion = struct {
 
     /// Free resources.
     pub fn deinit(self: *Suspicion, allocator: std.mem.Allocator) void {
+        var it = self.confirmations.keyIterator();
+        while (it.next()) |key| {
+            allocator.free(key.*);
+        }
         self.confirmations.deinit(allocator);
     }
 
@@ -63,7 +70,9 @@ pub const Suspicion = struct {
 
         // Dedup: only one confirmation per source.
         if (self.confirmations.contains(from)) return false;
-        try self.confirmations.put(allocator, from, {});
+        const from_owned = try allocator.dupe(u8, from);
+        errdefer allocator.free(from_owned);
+        try self.confirmations.put(allocator, from_owned, {});
 
         self.n += 1;
         return true;

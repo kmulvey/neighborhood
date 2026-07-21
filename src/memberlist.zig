@@ -147,7 +147,7 @@ pub const Memberlist = struct {
                         target.node.state = .dead;
                         target.last_heard_ms = now_ms;
                         try actions.append(alloc, .{ .node_failed = .{
-                            .node = target.node.name, .addr = target.node.addr,
+                            .node = try alloc.dupe(u8, target.node.name), .addr = target.node.addr,
                         } });
                         // Encode a Dead message for gossip dissemination.
                         var dead_buf: [512]u8 = undefined;
@@ -202,7 +202,7 @@ pub const Memberlist = struct {
                 self.probe_state = .waiting_direct;
                 self.probe_start_ms = now_ms;
                 try actions.append(alloc, .{ .send_ping = .{
-                    .target = target.node.name, .target_addr = target.node.addr, .seqno = self.probe_seqno,
+                    .target = try alloc.dupe(u8, target.node.name), .target_addr = target.node.addr, .seqno = self.probe_seqno,
                 } });
             },
             .waiting_direct => {
@@ -293,7 +293,7 @@ pub const Memberlist = struct {
         self.probe_state = .idle;
         // S4: advance probe_index past the just-suspected node to avoid wasted re-probe.
         self.probe_index = (self.probe_index + 1) % self.join_order.items.len;
-        try actions.append(alloc, .{ .node_suspected = .{ .node = target.node.name, .addr = target.node.addr } });
+        try actions.append(alloc, .{ .node_suspected = .{ .node = try alloc.dupe(u8, target.node.name), .addr = target.node.addr } });
 
         // B3: create a suspicion timer for this node.
         // k = suspicion_mult, min = k * protocol_period_ms, max = min * max_timeout_mult.
@@ -335,7 +335,7 @@ pub const Memberlist = struct {
             .indirect_ping => {
                 const iping = try protocol.decodeIndirectPing(alloc, data);
                 defer protocol.freeDecodedIndirectPing(&iping, alloc);
-                try actions.append(alloc, .{ .send_ping = .{ .target = iping.node, .target_addr = iping.target_addr, .seqno = iping.seqno } });
+                try actions.append(alloc, .{ .send_ping = .{ .target = try alloc.dupe(u8, iping.node), .target_addr = iping.target_addr, .seqno = iping.seqno } });
             },
             .ack => {
                 const ack = try protocol.decodeAck(alloc, data);
@@ -401,7 +401,7 @@ pub const Memberlist = struct {
                 entry.node.state = .alive;
                 entry.node.addr = addr;
                 entry.last_heard_ms = ts;
-                try actions.append(alloc, .{ .node_alive = .{ .node = name, .addr = addr } });
+                try actions.append(alloc, .{ .node_alive = .{ .node = try alloc.dupe(u8, name), .addr = addr } });
             }
         } else {
             const name_owned = try self.allocator.dupe(u8, name);
@@ -412,7 +412,7 @@ pub const Memberlist = struct {
             }, .last_heard_ms = ts });
             try self.name_to_index.put(self.allocator, name_owned, idx_new);
             try self.join_order.append(self.allocator, idx_new);
-            try actions.append(alloc, .{ .node_alive = .{ .node = name, .addr = addr } });
+            try actions.append(alloc, .{ .node_alive = .{ .node = try alloc.dupe(u8, name), .addr = addr } });
         }
     }
 
@@ -455,7 +455,7 @@ pub const Memberlist = struct {
                 entry.node.incarnation = incarnation;
                 entry.node.state = .suspect;
                 entry.last_heard_ms = ts;
-                try actions.append(alloc, .{ .node_suspected = .{ .node = name, .addr = addr } });
+                try actions.append(alloc, .{ .node_suspected = .{ .node = try alloc.dupe(u8, name), .addr = addr } });
             }
         }
     }
@@ -473,7 +473,7 @@ pub const Memberlist = struct {
                 entry.node.incarnation = incarnation;
                 entry.node.state = .dead;
                 entry.last_heard_ms = ts;
-                try actions.append(alloc, .{ .node_failed = .{ .node = name, .addr = addr } });
+                try actions.append(alloc, .{ .node_failed = .{ .node = try alloc.dupe(u8, name), .addr = addr } });
             }
         }
     }
@@ -500,12 +500,14 @@ pub const Memberlist = struct {
 pub fn freeActions(alloc: std.mem.Allocator, actions: []Action) void {
     for (actions) |action| {
         switch (action) {
+            .send_ping => |sp| alloc.free(sp.target),
             .send_ack => |sa| alloc.free(sa.payload),
             .send_gossip => |sg| {
                 alloc.free(sg.payload);
                 alloc.free(sg.target_addrs);
             },
             .push_pull_state => |pps| alloc.free(pps.state_bytes),
+            .node_alive, .node_suspected, .node_failed => |ev| alloc.free(ev.node),
             else => {},
         }
     }

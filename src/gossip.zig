@@ -105,6 +105,9 @@ pub const TransmitLimitedQueue = struct {
     /// Get the next batch of messages to gossip, up to `max_bytes` total.
     /// Returns messages that haven't yet reached the retransmit limit,
     /// ordered by priority.  Increments transmit counts.
+    ///
+    /// Each returned QueuedMessage owns its .node and .payload — caller must
+    /// free them with freeMessages().
     pub fn getMessages(self: *TransmitLimitedQueue, max_bytes: usize) ![]QueuedMessage {
         var result: std.ArrayListUnmanaged(QueuedMessage) = .empty;
 
@@ -134,7 +137,20 @@ pub const TransmitLimitedQueue = struct {
             const msg = &self.messages.items[i];
             if (total_bytes + msg.payload.len > max_bytes) continue;
             total_bytes += msg.payload.len;
-            try result.append(self.allocator, msg.*);
+
+            // Copy message into result with dup'd payload + node, so removals
+            // below don't dangle the pointers in result.
+            const node_dup = try self.allocator.dupe(u8, msg.node);
+            errdefer self.allocator.free(node_dup);
+            const payload_dup = try self.allocator.dupe(u8, msg.payload);
+            errdefer self.allocator.free(payload_dup);
+            try result.append(self.allocator, .{
+                .node = node_dup,
+                .payload = payload_dup,
+                .transmits = msg.transmits,
+                .msg_len = msg.msg_len,
+                .id = msg.id,
+            });
             msg.transmits += 1;
 
             if (msg.transmits >= max_tx) {
@@ -142,10 +158,8 @@ pub const TransmitLimitedQueue = struct {
             }
         }
 
-        // Remove in reverse order — the indices in `to_remove` are
-        // monotonically non-decreasing (eligible was sorted by index
-        // order within the messages list), so reverse preserves validity
-        // for each swapRemove (the last element shifts left).
+        // Remove in descending order so earlier indices stay valid after
+        // each swapRemove.  Update node_index for every moved element.
         if (to_remove.items.len > 0) {
             std.mem.sort(usize, to_remove.items, {}, struct {
                 fn desc(_: void, a: usize, b: usize) bool { return a > b; }
@@ -155,6 +169,10 @@ pub const TransmitLimitedQueue = struct {
                 self.allocator.free(self.messages.items[ri].node);
                 self.allocator.free(self.messages.items[ri].payload);
                 _ = self.messages.swapRemove(ri);
+                // If a different element moved into slot ri, update its index.
+                if (ri < self.messages.items.len) {
+                    try self.node_index.put(self.allocator, self.messages.items[ri].node, ri);
+                }
             }
         }
 
@@ -178,6 +196,16 @@ pub const TransmitLimitedQueue = struct {
     }
 };
 
+/// Free a slice of QueuedMessages returned by getMessages(), including
+/// each entry's .node and .payload.
+pub fn freeMessages(alloc: std.mem.Allocator, msgs: []QueuedMessage) void {
+    for (msgs) |m| {
+        alloc.free(m.node);
+        alloc.free(m.payload);
+    }
+    alloc.free(msgs);
+}
+
 // ==============================================================
 // Tests
 // ==============================================================
@@ -196,7 +224,7 @@ test "transmit limited queue ordering" {
     try q.queueMsg("node-c", "payload-ccc");
 
     const msgs = try q.getMessages(1024);
-    defer allocator.free(msgs);
+    defer freeMessages(allocator, msgs);
 
     // All should be returned (0 transmits each)
     try std.testing.expectEqual(@as(usize, 3), msgs.len);
@@ -218,7 +246,7 @@ test "transmit limited queue byte budget" {
 
     // Budget only allows first message
     const msgs = try q.getMessages(5);
-    defer allocator.free(msgs);
+    defer freeMessages(allocator, msgs);
 
     try std.testing.expectEqual(@as(usize, 1), msgs.len);
 }
@@ -237,6 +265,6 @@ test "transmit limited queue invalidation" {
 
     try std.testing.expectEqual(@as(usize, 1), q.len());
     const msgs = try q.getMessages(1024);
-    defer allocator.free(msgs);
+    defer freeMessages(allocator, msgs);
     try std.testing.expectEqualStrings("new-payload", msgs[0].payload);
 }
