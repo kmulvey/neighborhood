@@ -38,7 +38,7 @@ pub const TransmitLimitedQueue = struct {
     pub fn init(allocator: std.mem.Allocator, retransmit_mult: u8, num_nodes_fn: *const fn () usize) TransmitLimitedQueue {
         return .{
             .allocator = allocator,
-            .messages = .{},
+            .messages = .{ .items = &.{}, .capacity = 0 },
             .node_index = .{},
             .retransmit_mult = retransmit_mult,
             .num_nodes_fn = num_nodes_fn,

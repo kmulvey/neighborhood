@@ -168,10 +168,7 @@ pub fn encodeDead(buf: []u8, msg: Dead) !usize {
     return pos;
 }
 
-pub fn encodeCompound(buf: []u8, messages: []const struct {
-    msg_type: MessageType,
-    payload: []const u8,
-}) !usize {
+pub fn encodeCompound(buf: []u8, messages: []const CompoundMessage) !usize {
     var pos: usize = 0;
     try bufWriteU8(buf, &pos, @intFromEnum(MessageType.compound));
     try bufWriteU8(buf, &pos, @intCast(messages.len));
@@ -464,7 +461,7 @@ test "round-trip: compound" {
     const nack = Nack{ .seqno = 2 };
     const n2 = try encodeNack(&inner2_buf, nack);
 
-    const messages = [_]struct { msg_type: MessageType, payload: []const u8 }{
+    const messages = [_]CompoundMessage{
         .{ .msg_type = .ping, .payload = inner1_buf[1..n1] },
         .{ .msg_type = .nack, .payload = inner2_buf[1..n2] },
     };

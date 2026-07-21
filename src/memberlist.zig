@@ -100,6 +100,7 @@ pub const Memberlist = struct {
         // Free suspicion timers.
         var sit = self.suspicions.iterator();
         while (sit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             var s = entry.value_ptr;
             s.deinit(self.allocator);
         }
@@ -175,9 +176,11 @@ pub const Memberlist = struct {
         }
         // Remove expired suspicions by exact key match.
         for (expired.items) |key_copy| {
-            if (self.suspicions.getPtr(key_copy)) |s| {
-                s.deinit(self.allocator);
+            if (self.suspicions.getEntry(key_copy)) |entry| {
+                const original_key = entry.key_ptr.*;
+                entry.value_ptr.deinit(self.allocator);
                 _ = self.suspicions.remove(key_copy);
+                self.allocator.free(original_key);
             }
         }
 
@@ -225,7 +228,7 @@ pub const Memberlist = struct {
     }
 
     /// B4: Reshuffle join_order (Fisher-Yates) and compact dead/left entries.
-    fn reshuffleJoinOrder(self: *Memberlist, seed: i64, alloc: std.mem.Allocator) !void {
+    pub fn reshuffleJoinOrder(self: *Memberlist, seed: i64, alloc: std.mem.Allocator) !void {
         // Compact: filter out dead/left entries (except self at position 0).
         var compacted: std.ArrayListUnmanaged(usize) = .empty;
         try compacted.append(alloc, 0); // Keep self.
@@ -378,7 +381,7 @@ pub const Memberlist = struct {
                     inner_with_type[0] = @intFromEnum(inner.msg_type);
                     @memcpy(inner_with_type[1..], inner.payload);
                     const inner_actions = try self.handlePacket(inner_with_type, from_addr, from_name, timestamp_ms, alloc);
-                    defer freeActions(alloc, inner_actions);
+                    defer alloc.free(inner_actions);
                     try actions.appendSlice(alloc, inner_actions);
                 }
             },
@@ -393,10 +396,12 @@ pub const Memberlist = struct {
             if (incarnation > self.incarnation) self.incarnation = incarnation;
             return;
         }
-        // B3: if this node was suspected, remove its suspicion timer (alive refutes it).
-        if (self.suspicions.getPtr(name)) |s| {
-            s.deinit(self.allocator);
+        // B3: refuted suspicion — free key and timer.
+        if (self.suspicions.getEntry(name)) |entry| {
+            const original_key = entry.key_ptr.*;
+            entry.value_ptr.deinit(self.allocator);
             _ = self.suspicions.remove(name);
+            self.allocator.free(original_key);
         }
         if (self.name_to_index.get(name)) |idx| {
             var entry = &self.nodes.items[idx];
@@ -466,10 +471,12 @@ pub const Memberlist = struct {
 
     fn applyDead(self: *Memberlist, name: []const u8, addr: Address, incarnation: Incarnation, ts: i64, alloc: std.mem.Allocator, actions: *std.ArrayListUnmanaged(Action)) !void {
         if (std.mem.eql(u8, name, self.self_name)) return;
-        // B3: remove suspicion timer on dead confirmation.
-        if (self.suspicions.getPtr(name)) |s| {
-            s.deinit(self.allocator);
+        // B3: dead confirmation — free key and timer.
+        if (self.suspicions.getEntry(name)) |entry| {
+            const original_key = entry.key_ptr.*;
+            entry.value_ptr.deinit(self.allocator);
             _ = self.suspicions.remove(name);
+            self.allocator.free(original_key);
         }
         if (self.name_to_index.get(name)) |idx| {
             var entry = &self.nodes.items[idx];
