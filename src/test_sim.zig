@@ -35,7 +35,7 @@ test "sim 3 node converge" {
     };
     const nb_enc = try nb.protocol.encodeAlive(&buf, alive_b);
     const actions = try mla.handlePacket(buf[0..nb_enc], nb.Address.initIp4([4]u8{ 127, 0, 0, 2 }, 7946), "node-b", 0, allocator);
-    defer allocator.free(actions);
+    defer nb.freeActions(allocator, actions);
 
     try std.testing.expectEqual(@as(usize, 2), mla.nodeCount());
 }
@@ -56,7 +56,7 @@ test "sim partition detection" {
         };
         const n = try nb.protocol.encodeAlive(&buf, alive);
         const actions = try mla.handlePacket(buf[0..n], nb.Address.initIp4([4]u8{ 127, 0, 0, 2 }, 7946), "node-b", 0, allocator);
-        defer allocator.free(actions);
+        defer nb.freeActions(allocator, actions);
     }
 
     // Suspect node-b
@@ -70,7 +70,7 @@ test "sim partition detection" {
         };
         const n = try nb.protocol.encodeSuspect(&buf, suspect);
         const actions = try mla.handlePacket(buf[0..n], nb.Address.initIp4([4]u8{ 127, 0, 0, 3 }, 7946), "node-c", 0, allocator);
-        defer allocator.free(actions);
+        defer nb.freeActions(allocator, actions);
     }
 
     // Node-b should be suspect now

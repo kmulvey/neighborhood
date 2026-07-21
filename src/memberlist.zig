@@ -126,13 +126,20 @@ pub const Memberlist = struct {
         var actions: std.ArrayListUnmanaged(Action) = .empty;
 
         // ---- B3: expire suspicion timers ----
-        var expired: std.ArrayListUnmanaged(usize) = .empty;
-        defer expired.deinit(self.allocator);
+        // Collect keys of expired suspicions (must dup because the iterator
+        // borrows from the map and we can't remove while iterating).
+        var expired: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (expired.items) |k| self.allocator.free(k);
+            expired.deinit(self.allocator);
+        }
 
         var sit = self.suspicions.iterator();
         while (sit.next()) |entry| {
             if (entry.value_ptr.remainingMs(now_ms) <= 0) {
-                try expired.append(self.allocator, entry.key_ptr.*.len);
+                const key_copy = try self.allocator.dupe(u8, entry.key_ptr.*);
+                errdefer self.allocator.free(key_copy);
+                try expired.append(self.allocator, key_copy);
                 // Look up the node index to emit node_failed.
                 if (self.name_to_index.get(entry.key_ptr.*)) |idx| {
                     var target = &self.nodes.items[idx];
@@ -151,24 +158,22 @@ pub const Memberlist = struct {
                             .from = self.self_name,
                         };
                         const dead_n = try protocol.encodeDead(&dead_buf, dead_msg);
+                        const dead_payload = try alloc.alloc(u8, dead_n);
+                        errdefer alloc.free(dead_payload);
+                        @memcpy(dead_payload, dead_buf[0..dead_n]);
                         try actions.append(alloc, .{ .send_gossip = .{
                             .target_addrs = &.{},
-                            .payload = dead_buf[0..dead_n],
+                            .payload = dead_payload,
                         } });
                     }
                 }
             }
         }
-        // Remove expired suspicions (note: iterator above captured keys by length).
-        for (expired.items) |key_len| {
-            // Find the key by matching length — the iterator order is stable.
-            var sit2 = self.suspicions.iterator();
-            while (sit2.next()) |e2| {
-                if (e2.key_ptr.*.len == key_len) {
-                    e2.value_ptr.deinit(self.allocator);
-                    _ = self.suspicions.remove(e2.key_ptr.*);
-                    break;
-                }
+        // Remove expired suspicions by exact key match.
+        for (expired.items) |key_copy| {
+            if (self.suspicions.getPtr(key_copy)) |s| {
+                s.deinit(self.allocator);
+                _ = self.suspicions.remove(key_copy);
             }
         }
 
@@ -320,8 +325,11 @@ pub const Memberlist = struct {
                 var ack_buf: [128]u8 = undefined;
                 const ack = types.Ack{ .seqno = ping.seqno, .payload = "" };
                 const ack_n = try protocol.encodeAck(&ack_buf, ack);
+                const ack_payload = try alloc.alloc(u8, ack_n);
+                errdefer alloc.free(ack_payload);
+                @memcpy(ack_payload, ack_buf[0..ack_n]);
                 try actions.append(alloc, .{ .send_ack = .{
-                    .target_addr = from_addr, .seqno = ping.seqno, .payload = ack_buf[0..ack_n],
+                    .target_addr = from_addr, .seqno = ping.seqno, .payload = ack_payload,
                 } });
             },
             .indirect_ping => {
@@ -358,8 +366,15 @@ pub const Memberlist = struct {
                 var compound = try protocol.decodeCompound(alloc, data);
                 defer protocol.freeDecodedCompound(&compound, alloc);
                 for (compound.messages.items) |inner| {
-                    const inner_actions = try self.handlePacket(inner.payload, from_addr, from_name, timestamp_ms, alloc);
-                    defer alloc.free(inner_actions);
+                    // Prepend the type byte: handlePacket expects data[0] to
+                    // be the message type, but compound payloads store only
+                    // the body (after type + length bytes).
+                    const inner_with_type = try alloc.alloc(u8, inner.payload.len + 1);
+                    defer alloc.free(inner_with_type);
+                    inner_with_type[0] = @intFromEnum(inner.msg_type);
+                    @memcpy(inner_with_type[1..], inner.payload);
+                    const inner_actions = try self.handlePacket(inner_with_type, from_addr, from_name, timestamp_ms, alloc);
+                    defer freeActions(alloc, inner_actions);
                     try actions.appendSlice(alloc, inner_actions);
                 }
             },
@@ -415,6 +430,9 @@ pub const Memberlist = struct {
                     .meta = "",
                 };
                 const alive_n = try protocol.encodeAlive(&alive_buf, alive_msg);
+                const alive_payload = try alloc.alloc(u8, alive_n);
+                errdefer alloc.free(alive_payload);
+                @memcpy(alive_payload, alive_buf[0..alive_n]);
                 // Collect addresses of all alive peers.
                 var peer_addrs: std.ArrayListUnmanaged(Address) = .empty;
                 for (self.nodes.items) |entry| {
@@ -426,7 +444,7 @@ pub const Memberlist = struct {
                 }
                 try actions.append(alloc, .{ .send_gossip = .{
                     .target_addrs = try peer_addrs.toOwnedSlice(alloc),
-                    .payload = alive_buf[0..alive_n],
+                    .payload = alive_payload,
                 } });
             }
             return;
@@ -477,6 +495,23 @@ pub const Memberlist = struct {
     }
 };
 
+/// Free heap-allocated fields within a slice of Actions, then free the slice
+/// itself.  The allocator must be the same one passed to tick/handlePacket.
+pub fn freeActions(alloc: std.mem.Allocator, actions: []Action) void {
+    for (actions) |action| {
+        switch (action) {
+            .send_ack => |sa| alloc.free(sa.payload),
+            .send_gossip => |sg| {
+                alloc.free(sg.payload);
+                alloc.free(sg.target_addrs);
+            },
+            .push_pull_state => |pps| alloc.free(pps.state_bytes),
+            else => {},
+        }
+    }
+    alloc.free(actions);
+}
+
 // ==============================================================
 // Tests
 // ==============================================================
@@ -493,7 +528,7 @@ test "memberlist tick single node" {
     var ml = try Memberlist.init(alloc, Config{ .name = "test-node" });
     defer ml.deinit();
     const actions = try ml.tick(0, alloc);
-    defer alloc.free(actions);
+    defer freeActions(alloc, actions);
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
 
@@ -506,7 +541,7 @@ test "memberlist handle ping" {
     const n = try protocol.encodePing(&buf, ping);
     const from = Address.initIp4([4]u8{ 127, 0, 0, 1 }, 9999);
     const actions = try ml.handlePacket(buf[0..n], from, "", 0, alloc);
-    defer alloc.free(actions);
+    defer freeActions(alloc, actions);
     try std.testing.expect(actions.len >= 1);
 }
 
@@ -519,7 +554,7 @@ test "memberlist handle alive adds node" {
     const n = try protocol.encodeAlive(&buf, alive);
     const from = Address.initIp4([4]u8{ 127, 0, 0, 2 }, 7946);
     const actions = try ml.handlePacket(buf[0..n], from, "node-b", 0, alloc);
-    defer alloc.free(actions);
+    defer freeActions(alloc, actions);
     try std.testing.expectEqual(@as(usize, 2), ml.nodeCount());
 }
 
@@ -535,7 +570,7 @@ test "memberlist incarnation overrides" {
         const n = try protocol.encodeAlive(&buf, alive);
         const from = Address.initIp4([4]u8{ 127, 0, 0, 2 }, 7946);
         const actions = try ml.handlePacket(buf[0..n], from, "node-b", 0, alloc);
-        defer alloc.free(actions);
+        defer freeActions(alloc, actions);
     }
     // Suspect node-b incarnation 0
     {
@@ -544,7 +579,7 @@ test "memberlist incarnation overrides" {
         const n = try protocol.encodeSuspect(&buf, suspect);
         const from = Address.initIp4([4]u8{ 127, 0, 0, 3 }, 7946);
         const actions = try ml.handlePacket(buf[0..n], from, "", 0, alloc);
-        defer alloc.free(actions);
+        defer freeActions(alloc, actions);
     }
     try std.testing.expectEqual(NodeState.suspect, ml.nodes.items[1].node.state);
     // Alive incarnation 1 should override
@@ -554,7 +589,7 @@ test "memberlist incarnation overrides" {
         const n = try protocol.encodeAlive(&buf, alive);
         const from = Address.initIp4([4]u8{ 127, 0, 0, 2 }, 7946);
         const actions = try ml.handlePacket(buf[0..n], from, "node-b", 0, alloc);
-        defer alloc.free(actions);
+        defer freeActions(alloc, actions);
     }
     try std.testing.expectEqual(NodeState.alive, ml.nodes.items[1].node.state);
     try std.testing.expectEqual(@as(Incarnation, 1), ml.nodes.items[1].node.incarnation);
@@ -572,7 +607,7 @@ test "self suspect refutation emits send_gossip" {
         const n = try protocol.encodeAlive(&buf, alive);
         const from = Address.initIp4([4]u8{ 127, 0, 0, 2 }, 7946);
         const actions = try ml.handlePacket(buf[0..n], from, "node-b", 0, alloc);
-        defer alloc.free(actions);
+        defer freeActions(alloc, actions);
     }
 
     // Now suspect self.
@@ -582,7 +617,7 @@ test "self suspect refutation emits send_gossip" {
         const n = try protocol.encodeSuspect(&buf, suspect);
         const from = Address.initIp4([4]u8{ 127, 0, 0, 3 }, 7946);
         const actions = try ml.handlePacket(buf[0..n], from, "", 0, alloc);
-        defer alloc.free(actions);
+        defer freeActions(alloc, actions);
 
         // Should have emitted send_gossip with our new alive message.
         try std.testing.expect(actions.len >= 1);

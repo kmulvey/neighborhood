@@ -51,6 +51,7 @@ pub const MessageType = types.MessageType;
 pub const Action = types.Action;
 pub const ActionTag = types.ActionTag;
 pub const Memberlist = memberlist.Memberlist;
+pub const freeActions = memberlist.freeActions;
 pub const Neighborhood = neighborhood.Neighborhood;
 
 // Wire types

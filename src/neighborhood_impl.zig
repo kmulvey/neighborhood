@@ -61,14 +61,14 @@ pub const Neighborhood = struct {
     /// Join a cluster by contacting known nodes.
     pub fn join(self: *Neighborhood, known_nodes: []const Node) !void {
         const actions = try self.memberlist.join(known_nodes);
-        defer self.allocator.free(actions);
+        defer memberlist_mod.freeActions(self.allocator, actions);
         try self.executeActions(actions);
     }
 
     /// Gracefully leave the cluster.
     pub fn leave(self: *Neighborhood) !void {
         const actions = try self.memberlist.leave();
-        defer self.allocator.free(actions);
+        defer memberlist_mod.freeActions(self.allocator, actions);
         try self.executeActions(actions);
     }
 
