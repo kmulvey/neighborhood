@@ -161,8 +161,12 @@ pub const Memberlist = struct {
                         const dead_payload = try alloc.alloc(u8, dead_n);
                         errdefer alloc.free(dead_payload);
                         @memcpy(dead_payload, dead_buf[0..dead_n]);
+                        // Heap-allocate an empty target list so freeActions
+                        // can safely free it (comptime &.{} is non-heap).
+                        const empty_addrs = try alloc.alloc(Address, 0);
+                        errdefer alloc.free(empty_addrs);
                         try actions.append(alloc, .{ .send_gossip = .{
-                            .target_addrs = &.{},
+                            .target_addrs = empty_addrs,
                             .payload = dead_payload,
                         } });
                     }
@@ -300,10 +304,10 @@ pub const Memberlist = struct {
         const k: u8 = self.config.suspicion_mult;
         const min_ms: i64 = @as(i64, k) * self.protocol_period_ms;
         const max_ms: i64 = min_ms * @as(i64, self.config.suspicion_max_timeout_mult);
-        const s = try Suspicion.init(alloc, self.self_name, k, min_ms, max_ms, now_ms);
-        const node_name_owned = try alloc.dupe(u8, target.node.name);
-        errdefer alloc.free(node_name_owned);
-        try self.suspicions.put(alloc, node_name_owned, s);
+        const s = try Suspicion.init(self.allocator, self.self_name, k, min_ms, max_ms, now_ms);
+        const node_name_owned = try self.allocator.dupe(u8, target.node.name);
+        errdefer self.allocator.free(node_name_owned);
+        try self.suspicions.put(self.allocator, node_name_owned, s);
     }
 
     /// Process an incoming raw packet. Returns owned slice of actions.
@@ -353,7 +357,7 @@ pub const Memberlist = struct {
                 defer protocol.freeDecodedSuspect(&suspect, alloc);
                 // B3: confirm on existing suspicion timer to accelerate it.
                 if (self.suspicions.getPtr(suspect.node)) |s| {
-                    _ = try s.confirm(suspect.from, alloc);
+                    _ = try s.confirm(suspect.from, self.allocator);
                 }
                 try self.applySuspect(suspect.node, suspect.addr, suspect.incarnation, timestamp_ms, alloc, &actions);
             },
@@ -391,7 +395,7 @@ pub const Memberlist = struct {
         }
         // B3: if this node was suspected, remove its suspicion timer (alive refutes it).
         if (self.suspicions.getPtr(name)) |s| {
-            s.deinit(alloc);
+            s.deinit(self.allocator);
             _ = self.suspicions.remove(name);
         }
         if (self.name_to_index.get(name)) |idx| {
@@ -464,7 +468,7 @@ pub const Memberlist = struct {
         if (std.mem.eql(u8, name, self.self_name)) return;
         // B3: remove suspicion timer on dead confirmation.
         if (self.suspicions.getPtr(name)) |s| {
-            s.deinit(alloc);
+            s.deinit(self.allocator);
             _ = self.suspicions.remove(name);
         }
         if (self.name_to_index.get(name)) |idx| {
