@@ -219,6 +219,7 @@ pub const ActionTag = enum {
     node_left,
     /// Full state ready for push/pull.
     push_pull_state,
+    user_message,
 };
 
 pub const Action = union(ActionTag) {
@@ -233,6 +234,11 @@ pub const Action = union(ActionTag) {
     node_alive: NodeEvent,
     node_left: NodeEvent,
     push_pull_state: PushPullState,
+    user_message: ActionUserMessage,
+};
+
+pub const ActionUserMessage = struct {
+    payload: []const u8,
 };
 
 pub const SendPing = struct {

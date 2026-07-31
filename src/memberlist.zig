@@ -380,7 +380,14 @@ pub const Memberlist = struct {
                     try actions.appendSlice(alloc, inner_actions);
                 }
             },
-            .user => {},
+            .user => {
+                var decoded = try protocol.decode(alloc, data);
+                defer protocol.freeDecoded(&decoded, alloc);
+                if (decoded == .user) {
+                    const payload = try alloc.dupe(u8, decoded.user.payload);
+                    try actions.append(alloc, .{ .user_message = .{ .payload = payload } });
+                }
+            },
             else => {},
         }
         return actions.toOwnedSlice(alloc);
@@ -499,6 +506,42 @@ pub const Memberlist = struct {
         try actions.append(self.allocator, .{ .node_left = .{ .node = self.self_name, .addr = self.nodes.items[self.self_index].node.addr } });
         return actions.toOwnedSlice(self.allocator);
     }
+
+    /// Queue a user-defined payload for gossip dissemination to all alive
+    /// peers. Returns send_gossip actions that the caller must dispatch over
+    /// UDP. Caller must free via `freeActions`.
+    pub fn queueUserMessage(self: *Memberlist, alloc: std.mem.Allocator, payload: []const u8) ![]Action {
+        var actions: std.ArrayListUnmanaged(Action) = .empty;
+        errdefer actions.deinit(alloc);
+
+        // Build address list of alive peers (excluding self)
+        var targets: std.ArrayListUnmanaged(Address) = .empty;
+        for (self.nodes.items) |entry| {
+            if (entry.node.state == .alive and entry.node.name.len > 0 and
+                !std.mem.eql(u8, entry.node.name, self.self_name))
+            {
+                try targets.append(alloc, entry.node.addr);
+            }
+        }
+        if (targets.items.len == 0) {
+            targets.deinit(alloc);
+            return &.{};
+        }
+
+        // Encode user message on the wire: 1-byte type + payload
+        const wire_len: usize = 1 + payload.len;
+        const wire = try alloc.alloc(u8, wire_len);
+        errdefer alloc.free(wire);
+        wire[0] = @intFromEnum(MessageType.user);
+        @memcpy(wire[1..], payload);
+
+        try actions.append(alloc, .{ .send_gossip = .{
+            .target_addrs = try targets.toOwnedSlice(alloc),
+            .payload = wire,
+        }});
+
+        return actions.toOwnedSlice(alloc);
+    }
 };
 
 /// Free heap-allocated fields within a slice of Actions, then free the slice
@@ -514,6 +557,7 @@ pub fn freeActions(alloc: std.mem.Allocator, actions: []Action) void {
             },
             .push_pull_state => |pps| alloc.free(pps.state_bytes),
             .node_alive, .node_suspected, .node_failed => |ev| alloc.free(ev.node),
+            .user_message => |*um| alloc.free(um.payload),
             else => {},
         }
     }
